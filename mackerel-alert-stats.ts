@@ -4,8 +4,9 @@
  * Mackerel の期間中のアラート履歴を集計しScrapboxのテーブル形式で出力するスクリプト.
  * 実行例:
  *   MACKEREL_APIKEY=*** ./mackerel-alert-stats.ts --from $(date -d "2 week ago" +%Y-%m-%dT%H:%M:%S+0900) --to $(date +%Y-%m-%dT%H:%M:%S+0900) [--notificationGroupId <id> | --channelId <id>]
- * --notificationGroupId: その通知グループに届くアラートのみに絞る (子通知グループとして転送してくる親の通知グループの分も含む)
- * --channelId: その通知チャンネルに届くアラートのみに絞る (デフォルト通知グループ経由の分は含まない)
+ * --notificationGroupId: その通知グループのスコープ (この通知グループを子に持つ祖先の通知グループの分も含む) に入る監視ルールのアラートのみに絞る
+ * --channelId: その通知チャンネルを持つ通知グループのスコープ (祖先の通知グループの分も含む) に入る監視ルールのアラートのみに絞る
+ * いずれもデフォルト通知グループ経由の分は含まない
  * @module
  */
 
@@ -25,7 +26,12 @@ const cli = new MackerelClient(apiKey);
 const flags = parseArgs(Deno.args, {
   string: ['from', 'to', 'notificationGroupId', 'channelId'],
 });
-if (flags.notificationGroupId && flags.channelId) {
+for (const name of ['notificationGroupId', 'channelId'] as const) {
+  if (flags[name] === '') {
+    throw new Error(`--${name} requires a value`);
+  }
+}
+if (flags.notificationGroupId !== undefined && flags.channelId !== undefined) {
   throw new Error('--notificationGroupId and --channelId cannot be specified together');
 }
 const from = new Date(flags.from ?? '');
@@ -53,11 +59,11 @@ const windowMin = Math.round((to.valueOf() - from.valueOf())/60000)
 type NotificationScope = {
   monitorIds: Set<string>;
   serviceNames: Set<string>;
+  excludedMonitorIds: Set<string>;
 };
 
-// 通知グループ・通知チャンネルでフィルタリングするための情報を取得
 let notificationScope: NotificationScope | null = null;
-if (flags.notificationGroupId || flags.channelId) {
+if (flags.notificationGroupId !== undefined || flags.channelId !== undefined) {
   notificationScope = await getNotificationScope({
     notificationGroupId: flags.notificationGroupId,
     channelId: flags.channelId,
@@ -138,6 +144,7 @@ type Monitor = Awaited<ReturnType<typeof cli.monitors.get>>;
 
 function isMonitorInScope(monitorId: string, monitor: Monitor, scope: NotificationScope): boolean {
   if (scope.monitorIds.has(monitorId)) return true;
+  if (scope.excludedMonitorIds.has(monitorId)) return false;
 
   if ('serviceName' in monitor && monitor.serviceName && scope.serviceNames.has(monitor.serviceName)) {
     return true;
@@ -151,7 +158,6 @@ function isMonitorInScope(monitorId: string, monitor: Monitor, scope: Notificati
   return false;
 }
 
-// 子通知グループは親の通知グループに来た通知の転送先なので、起点の通知グループに加えて祖先の通知グループのスコープも対象にする
 async function getNotificationScope(
   { notificationGroupId, channelId }: { notificationGroupId?: string; channelId?: string },
 ): Promise<NotificationScope> {
@@ -166,10 +172,11 @@ async function getNotificationScope(
   } else {
     startGroups = notificationGroups.filter(ng => ng.childChannelIds.includes(channelId!));
     if (startGroups.length === 0) {
-      throw new Error(`No notification group notifies channel ${channelId}`);
+      throw new Error(`No notification group notifies channel ${channelId} (notifications via the default notification group are not supported)`);
     }
   }
 
+  // 子通知グループには親の通知グループに来た通知も届くので、祖先の通知グループのスコープも含める
   const parentsById = new Map<string, NotificationGroup[]>();
   for (const group of notificationGroups) {
     for (const childId of group.childNotificationGroupIds) {
@@ -193,8 +200,19 @@ async function getNotificationScope(
     console.error(`注意: Critical のみ通知する通知グループ (${criticalGroups.map(g => g.name).join(', ')}) を経由するアラートは、Warning も集計に含まれます`);
   }
 
-  return {
-    monitorIds: new Set(groups.flatMap(g => g.scopes.monitors.map(m => m.id))),
-    serviceNames: new Set(groups.flatMap(g => g.scopes.services.map(s => s.name))),
-  };
+  const monitorIds = new Set(groups.flatMap(g => g.scopes.monitors.map(m => m.id)));
+  const serviceNames = new Set(groups.flatMap(g => g.scopes.services.map(s => s.name)));
+  if (monitorIds.size === 0 && serviceNames.size === 0) {
+    throw new Error('Target notification groups have no services or monitors in scope (notifications via the default notification group are not supported)');
+  }
+
+  // 「この通知グループのみに通知する」が有効な監視ルールは、それを指定した通知グループ以外には通知されない
+  const excludedMonitorIds = new Set(
+    notificationGroups
+      .flatMap(g => g.scopes.monitors)
+      .filter(m => m.maskDefaultNotificationGroup && !monitorIds.has(m.id))
+      .map(m => m.id),
+  );
+
+  return { monitorIds, serviceNames, excludedMonitorIds };
 }
